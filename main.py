@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 App Volume Muter - PyQt6 GUI Application with QSS Styling
+支持全局模式和单独模式，可配置每个应用的独立热键
 Requirements: PyQt6, pycaw, comtypes, keyboard
 """
 
 import sys
 import json
 import os
-import threading
 from typing import Dict, List, Optional
 
 from PyQt6.QtWidgets import (
@@ -42,8 +42,9 @@ class ConfigManager:
     """管理 config.json 的读写"""
     
     DEFAULT_CONFIG = {
+        "mode": "global",  # "global" 或 "individual"
         "hotkey": "ctrl+shift+m",
-        "apps": {}  # { "process_name.exe": {"enabled": true, "last_mute": false} }
+        "apps": {}  # { "process_name.exe": {"enabled": false, "individual_hotkey": null} }
     }
     
     def __init__(self, filepath: str = CONFIG_FILE):
@@ -55,9 +56,15 @@ class ConfigManager:
             try:
                 with open(self.filepath, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
-                    # 合并默认配置，防止缺少字段
                     merged = self.DEFAULT_CONFIG.copy()
                     merged.update(loaded)
+                    # 确保 apps 中的每个项都有完整字段
+                    if "apps" in merged:
+                        for app_name, app_data in merged["apps"].items():
+                            if "enabled" not in app_data:
+                                app_data["enabled"] = False
+                            if "individual_hotkey" not in app_data:
+                                app_data["individual_hotkey"] = None
                     return merged
             except Exception as e:
                 print(f"加载配置失败: {e}")
@@ -71,6 +78,12 @@ class ConfigManager:
         except Exception as e:
             print(f"保存配置失败: {e}")
             return False
+    
+    def get_mode(self) -> str:
+        return self.config.get("mode", "global")
+    
+    def set_mode(self, mode: str):
+        self.config["mode"] = mode
     
     def get_hotkey(self) -> str:
         return self.config.get("hotkey", "ctrl+shift+m")
@@ -88,6 +101,16 @@ class ConfigManager:
             self.config["apps"][process_name] = {}
         self.config["apps"][process_name]["enabled"] = enabled
     
+    def get_app_individual_hotkey(self, process_name: str) -> Optional[str]:
+        return self.config.get("apps", {}).get(process_name, {}).get("individual_hotkey")
+    
+    def set_app_individual_hotkey(self, process_name: str, hotkey: Optional[str]):
+        if "apps" not in self.config:
+            self.config["apps"] = {}
+        if process_name not in self.config["apps"]:
+            self.config["apps"][process_name] = {}
+        self.config["apps"][process_name]["individual_hotkey"] = hotkey
+    
     def remove_app(self, process_name: str):
         if process_name in self.config.get("apps", {}):
             del self.config["apps"][process_name]
@@ -98,17 +121,14 @@ class AudioController:
     
     @staticmethod
     def get_audio_sessions() -> List[dict]:
-        """获取所有音频会话"""
         if not AUDIO_AVAILABLE:
             return []
-        
         sessions = []
         try:
             for session in AudioUtilities.GetAllSessions():
                 process = session.Process
                 if process is None:
                     continue
-                
                 volume = session.SimpleAudioVolume
                 sessions.append({
                     "name": process.name(),
@@ -120,15 +140,12 @@ class AudioController:
                 })
         except Exception as e:
             print(f"获取音频会话失败: {e}")
-        
         return sessions
     
     @staticmethod
     def set_app_mute(process_name: str, mute: bool) -> bool:
-        """设置指定应用的静音状态"""
         if not AUDIO_AVAILABLE:
             return False
-        
         try:
             for session in AudioUtilities.GetAllSessions():
                 process = session.Process
@@ -145,7 +162,6 @@ class AudioController:
         """切换指定应用的静音状态，返回新状态"""
         if not AUDIO_AVAILABLE:
             return None
-        
         try:
             for session in AudioUtilities.GetAllSessions():
                 process = session.Process
@@ -160,85 +176,124 @@ class AudioController:
 
 
 class HotkeySignals(QObject):
-    """用于线程间通信的信号"""
-    triggered = pyqtSignal()
+    triggered = pyqtSignal(str)  # "global" 或 process_name
 
 
 class HotkeyListenerThread(QThread):
-    """在后台线程监听全局热键"""
+    """在后台线程监听全局热键，支持全局模式和单独模式"""
     
-    def __init__(self, hotkey: str):
+    def __init__(self, config_manager: ConfigManager):
         super().__init__()
-        self.hotkey = hotkey
+        self.config = config_manager
         self.signals = HotkeySignals()
         self._running = True
-        self._handler = None
+        self._handlers = []
     
     def run(self):
         if not HOTKEY_AVAILABLE:
             return
+        self._register_hotkeys()
+        while self._running:
+            self.msleep(100)
+    
+    def _register_hotkeys(self):
+        """根据当前配置注册热键"""
+        # 清除旧热键
+        for h in self._handlers:
+            try:
+                keyboard.remove_hotkey(h)
+            except:
+                pass
+        self._handlers = []
         
-        try:
-            # 注册热键，回调中发射信号到主线程
-            self._handler = keyboard.add_hotkey(
-                self.hotkey, 
-                lambda: self.signals.triggered.emit()
-            )
-            # 保持线程存活
-            while self._running:
-                self.msleep(100)
-        except Exception as e:
-            print(f"热键监听错误: {e}")
+        mode = self.config.get_mode()
+        
+        if mode == "global":
+            hotkey = self.config.get_hotkey()
+            if hotkey:
+                try:
+                    h = keyboard.add_hotkey(hotkey, lambda: self.signals.triggered.emit("global"))
+                    self._handlers.append(h)
+                except Exception as e:
+                    print(f"注册全局热键失败: {e}")
+        else:
+            # 单独模式：为每个启用的应用注册热键
+            for name, info in self.config.get_apps().items():
+                if info.get("enabled") and info.get("individual_hotkey"):
+                    hk = info["individual_hotkey"]
+                    try:
+                        # 使用默认参数捕获 name，避免闭包问题
+                        h = keyboard.add_hotkey(hk, lambda n=name: self.signals.triggered.emit(n))
+                        self._handlers.append(h)
+                    except Exception as e:
+                        print(f"注册单独热键失败 [{name}]: {e}")
     
     def stop(self):
         self._running = False
-        if self._handler and HOTKEY_AVAILABLE:
+        for h in self._handlers:
             try:
-                keyboard.remove_hotkey(self._handler)
+                keyboard.remove_hotkey(h)
             except:
                 pass
+        self._handlers = []
         self.wait(1000)
     
-    def update_hotkey(self, new_hotkey: str):
-        """更新热键，重新注册"""
-        if self._handler and HOTKEY_AVAILABLE:
+    def refresh(self):
+        """重新注册所有热键（配置变化时调用）"""
+        if not HOTKEY_AVAILABLE or not self._running:
+            return
+        for h in self._handlers:
             try:
-                keyboard.remove_hotkey(self._handler)
+                keyboard.remove_hotkey(h)
             except:
                 pass
-        
-        self.hotkey = new_hotkey
-        try:
-            self._handler = keyboard.add_hotkey(
-                self.hotkey,
-                lambda: self.signals.triggered.emit()
-            )
-        except Exception as e:
-            print(f"更新热键失败: {e}")
+        self._handlers = []
+        self._register_hotkeys()
 
 
 class HotkeyCaptureButton(QPushButton):
-    """可捕获按键组合的按钮"""
+    """可捕获按键组合的按钮 - 修复撑大盒子问题"""
     
     captured = pyqtSignal(str)
     
     def __init__(self, parent=None):
-        super().__init__("点击设置热键", parent)
+        super().__init__("点击设置", parent)
         self.setCheckable(True)
         self.capturing = False
-        self.pressed_keys = set()
+        # 固定尺寸，防止撑大父布局
+        self.setFixedWidth(130)
+        self.setFixedHeight(28)
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: #ffffff;
+                border: 1px solid #2563eb;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            QPushButton:pressed {
+                background-color: #1d4ed8;
+            }
+        """)
         self.clicked.connect(self.on_click)
-        self.setMinimumWidth(150)
     
     def on_click(self):
         if self.isChecked():
             self.capturing = True
-            self.setText("请按下按键组合...")
+            self.setText("按组合键...")
             self.setStyleSheet("""
                 QPushButton {
                     background-color: #f59e0b;
                     color: #ffffff;
                     border: 2px solid #d97706;
+                    border-radius: 4px;
+                    padding: 1px 5px;
+                    font-size: 12px;
                     font-weight: bold;
                 }
             """)
@@ -249,14 +304,15 @@ class HotkeyCaptureButton(QPushButton):
     def cancel_capture(self):
         self.capturing = False
         self.setChecked(False)
-        self.setText("点击设置热键")
+        self.setText("点击设置")
         self.setStyleSheet("""
             QPushButton {
                 background-color: #3b82f6;
                 color: #ffffff;
                 border: 1px solid #2563eb;
-                border-radius: 6px;
-                padding: 6px 16px;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-size: 12px;
                 font-weight: 500;
             }
             QPushButton:hover {
@@ -267,21 +323,23 @@ class HotkeyCaptureButton(QPushButton):
             }
         """)
         self.releaseKeyboard()
-        self.pressed_keys.clear()
+    
+    def set_hotkey_text(self, text: Optional[str]):
+        """设置显示的热键文本（非捕获状态）"""
+        if not self.capturing:
+            display = text if text else "点击设置"
+            self.setText(display)
+            self.setToolTip(text if text else "点击设置快捷键")
     
     def keyPressEvent(self, event):
         if not self.capturing:
             super().keyPressEvent(event)
             return
         
-        # 忽略单独的修饰键，等待组合键
         key = event.key()
         mod = event.modifiers()
-        
-        # 构建按键名称列表
         keys = []
         
-        # 修饰键
         if mod & Qt.KeyboardModifier.ControlModifier:
             keys.append("ctrl")
         if mod & Qt.KeyboardModifier.ShiftModifier:
@@ -291,37 +349,38 @@ class HotkeyCaptureButton(QPushButton):
         if mod & Qt.KeyboardModifier.MetaModifier:
             keys.append("win")
         
-        # 普通键
         key_name = QKeySequence(key).toString().lower().strip()
         if key_name and key_name not in ['ctrl', 'shift', 'alt', 'meta']:
             keys.append(key_name)
-        elif 48 <= key <= 57:  # 0-9
+        elif 48 <= key <= 57:
             keys.append(chr(key).lower())
-        elif 65 <= key <= 90:  # A-Z
+        elif 65 <= key <= 90:
             keys.append(chr(key).lower())
-        elif 112 <= key <= 123:  # F1-F12
+        elif 112 <= key <= 123:
             keys.append(f"f{key - 111}")
         
         if len(keys) >= 2 or (len(keys) == 1 and keys[0] not in ['ctrl', 'shift', 'alt', 'win']):
             hotkey_str = "+".join(keys)
             self.captured.emit(hotkey_str)
             self.cancel_capture()
-        else:
-            # 只按了修饰键，继续等待
-            pass
     
     def keyReleaseEvent(self, event):
         if not self.capturing:
             super().keyReleaseEvent(event)
+    
+    def focusOutEvent(self, event):
+        """失去焦点时自动取消捕获，避免卡住"""
+        if self.capturing:
+            self.cancel_capture()
+        super().focusOutEvent(event)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("应用音量静音控制器")
-        self.setMinimumSize(720, 520)
+        self.setMinimumSize(820, 560)
         
-        # 初始化组件
         self.config = ConfigManager()
         self.hotkey_thread: Optional[HotkeyListenerThread] = None
         
@@ -329,14 +388,13 @@ class MainWindow(QMainWindow):
         self.apply_styles()
         self.start_hotkey_listener()
         self.refresh_app_list()
+        self.update_mode_ui()
     
     def apply_styles(self):
-        """应用 QSS 样式表"""
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #f3f4f6;
             }
-            
             QGroupBox {
                 font-weight: bold;
                 font-size: 13px;
@@ -350,19 +408,16 @@ class MainWindow(QMainWindow):
                 padding-right: 12px;
                 background-color: #ffffff;
             }
-            
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 12px;
                 padding: 0 8px;
                 color: #374151;
             }
-            
             QLabel {
                 color: #374151;
                 font-size: 13px;
             }
-            
             QLineEdit {
                 background-color: #f9fafb;
                 border: 1px solid #d1d5db;
@@ -372,11 +427,9 @@ class MainWindow(QMainWindow):
                 font-size: 13px;
                 selection-background-color: #3b82f6;
             }
-            
             QLineEdit:focus {
                 border: 2px solid #3b82f6;
             }
-            
             QPushButton {
                 background-color: #3b82f6;
                 color: #ffffff;
@@ -386,20 +439,16 @@ class MainWindow(QMainWindow):
                 font-size: 13px;
                 font-weight: 500;
             }
-            
             QPushButton:hover {
                 background-color: #2563eb;
             }
-            
             QPushButton:pressed {
                 background-color: #1d4ed8;
             }
-            
             QPushButton:disabled {
                 background-color: #9ca3af;
                 color: #e5e7eb;
             }
-            
             QTableWidget {
                 background-color: #ffffff;
                 border: 1px solid #e5e7eb;
@@ -408,17 +457,14 @@ class MainWindow(QMainWindow):
                 font-size: 13px;
                 color: #1f2937;
             }
-            
             QTableWidget::item {
-                padding: 6px;
+                padding: 4px;
                 border-bottom: 1px solid #f3f4f6;
             }
-            
             QTableWidget::item:selected {
                 background-color: #dbeafe;
                 color: #1e40af;
             }
-            
             QHeaderView::section {
                 background-color: #f9fafb;
                 color: #374151;
@@ -428,13 +474,11 @@ class MainWindow(QMainWindow):
                 font-weight: 600;
                 font-size: 12px;
             }
-            
             QCheckBox {
                 color: #374151;
                 font-size: 13px;
                 spacing: 6px;
             }
-            
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
@@ -442,32 +486,26 @@ class MainWindow(QMainWindow):
                 border: 2px solid #d1d5db;
                 background-color: #ffffff;
             }
-            
             QCheckBox::indicator:checked {
                 background-color: #3b82f6;
                 border-color: #3b82f6;
             }
-            
             QCheckBox::indicator:hover {
                 border-color: #3b82f6;
             }
-            
             QScrollBar:vertical {
                 background-color: #f9fafb;
                 width: 10px;
                 border-radius: 5px;
             }
-            
             QScrollBar::handle:vertical {
                 background-color: #d1d5db;
                 border-radius: 5px;
                 min-height: 30px;
             }
-            
             QScrollBar::handle:vertical:hover {
                 background-color: #9ca3af;
             }
-            
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
             }
@@ -481,18 +519,29 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         
         # === 热键配置区域 ===
-        hotkey_group = QGroupBox("全局热键配置")
+        hotkey_group = QGroupBox("热键配置")
         hotkey_layout = QHBoxLayout(hotkey_group)
         hotkey_layout.setSpacing(12)
         
-        hotkey_layout.addWidget(QLabel("当前热键:"))
+        # 模式切换按钮
+        self.mode_btn = QPushButton()
+        self.mode_btn.setFixedWidth(120)
+        self.mode_btn.setFixedHeight(34)
+        self.mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_btn.clicked.connect(self.toggle_mode)
+        hotkey_layout.addWidget(self.mode_btn)
+        
+        hotkey_layout.addWidget(QLabel("全局热键:"))
         self.hotkey_display = QLineEdit(self.config.get_hotkey())
         self.hotkey_display.setReadOnly(True)
-        self.hotkey_display.setMinimumWidth(160)
+        self.hotkey_display.setFixedWidth(160)
+        self.hotkey_display.setFixedHeight(32)
         self.hotkey_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hotkey_layout.addWidget(self.hotkey_display)
         
         self.capture_btn = HotkeyCaptureButton()
+        self.capture_btn.setFixedWidth(130)
+        self.capture_btn.setFixedHeight(32)
         self.capture_btn.captured.connect(self.on_hotkey_captured)
         hotkey_layout.addWidget(self.capture_btn)
         
@@ -509,15 +558,22 @@ class MainWindow(QMainWindow):
         toolbar.setSpacing(10)
         
         self.refresh_btn = QPushButton("刷新应用列表")
-        self.refresh_btn.setMinimumWidth(120)
+        self.refresh_btn.setFixedWidth(120)
+        self.refresh_btn.setFixedHeight(34)
         self.refresh_btn.clicked.connect(self.refresh_app_list)
         toolbar.addWidget(self.refresh_btn)
         
         self.mute_all_btn = QPushButton("一键静音已启用")
-        self.mute_all_btn.setMinimumWidth(130)
+        self.mute_all_btn.setFixedWidth(130)
+        self.mute_all_btn.setFixedHeight(34)
         self.mute_all_btn.setStyleSheet("""
             QPushButton {
                 background-color: #ef4444;
+                border-radius: 6px;
+                padding: 7px 18px;
+                font-size: 13px;
+                font-weight: 500;
+                color: #ffffff;
             }
             QPushButton:hover {
                 background-color: #dc2626;
@@ -530,10 +586,16 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.mute_all_btn)
         
         self.unmute_all_btn = QPushButton("一键取消静音")
-        self.unmute_all_btn.setMinimumWidth(130)
+        self.unmute_all_btn.setFixedWidth(130)
+        self.unmute_all_btn.setFixedHeight(34)
         self.unmute_all_btn.setStyleSheet("""
             QPushButton {
                 background-color: #10b981;
+                border-radius: 6px;
+                padding: 7px 18px;
+                font-size: 13px;
+                font-weight: 500;
+                color: #ffffff;
             }
             QPushButton:hover {
                 background-color: #059669;
@@ -550,13 +612,15 @@ class MainWindow(QMainWindow):
         
         # 表格
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["启用", "应用名称", "当前状态", "PID"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["启用", "应用名称", "当前状态", "PID", "单独热键"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(2, 100)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 60)
+        self.table.setColumnWidth(2, 100)
         self.table.setColumnWidth(3, 80)
+        self.table.setColumnWidth(4, 150)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
@@ -576,10 +640,16 @@ class MainWindow(QMainWindow):
         bottom.addStretch()
         
         self.save_btn = QPushButton("保存配置")
-        self.save_btn.setMinimumWidth(120)
+        self.save_btn.setFixedWidth(120)
+        self.save_btn.setFixedHeight(34)
         self.save_btn.setStyleSheet("""
             QPushButton {
                 background-color: #6366f1;
+                border-radius: 6px;
+                padding: 7px 18px;
+                font-size: 13px;
+                font-weight: 500;
+                color: #ffffff;
             }
             QPushButton:hover {
                 background-color: #4f46e5;
@@ -601,41 +671,107 @@ class MainWindow(QMainWindow):
             self.status_label.setText("未安装 keyboard，全局热键不可用 (pip install keyboard)")
             self.status_label.setStyleSheet("color: #dc2626; font-weight: bold;")
     
+    def update_mode_ui(self):
+        """根据当前模式更新 UI 状态"""
+        mode = self.config.get_mode()
+        is_global = (mode == "global")
+        
+        # 模式按钮
+        self.mode_btn.setText("全局模式" if is_global else "单独模式")
+        self.mode_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {'#3b82f6' if is_global else '#8b5cf6'};
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 13px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {'#2563eb' if is_global else '#7c3aed'};
+            }}
+        """)
+        
+        # 全局热键区域
+        self.hotkey_display.setEnabled(is_global)
+        self.capture_btn.setEnabled(is_global)
+        if not is_global:
+            self.capture_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #d1d5db;
+                    color: #9ca3af;
+                    border: 1px solid #d1d5db;
+                    border-radius: 4px;
+                    padding: 2px 6px;
+                    font-size: 12px;
+                    font-weight: 500;
+                }
+            """)
+        else:
+            self.capture_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3b82f6;
+                    color: #ffffff;
+                    border: 1px solid #2563eb;
+                    border-radius: 4px;
+                    padding: 2px 6px;
+                    font-size: 12px;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    background-color: #2563eb;
+                }
+                QPushButton:pressed {
+                    background-color: #1d4ed8;
+                }
+            """)
+    
+    def toggle_mode(self):
+        """切换全局/单独模式"""
+        current = self.config.get_mode()
+        new_mode = "individual" if current == "global" else "global"
+        self.config.set_mode(new_mode)
+        self.update_mode_ui()
+        self.refresh_app_list()
+        if self.hotkey_thread:
+            self.hotkey_thread.refresh()
+        self.auto_save()
+        self.status_label.setText(f"已切换到{'单独' if new_mode == 'individual' else '全局'}模式")
+        self.status_label.setStyleSheet("color: #3b82f6; font-weight: bold;")
+    
     def start_hotkey_listener(self):
-        """启动热键监听线程"""
         if not HOTKEY_AVAILABLE:
             return
-        
         if self.hotkey_thread and self.hotkey_thread.isRunning():
             self.hotkey_thread.stop()
-        
-        self.hotkey_thread = HotkeyListenerThread(self.config.get_hotkey())
-        self.hotkey_thread.signals.triggered.connect(self.on_global_hotkey)
+        self.hotkey_thread = HotkeyListenerThread(self.config)
+        self.hotkey_thread.signals.triggered.connect(self.on_hotkey_triggered)
         self.hotkey_thread.start()
     
+    def on_hotkey_triggered(self, target: str):
+        if target == "global":
+            self.on_global_hotkey()
+        else:
+            self.on_individual_hotkey(target)
+    
     def on_global_hotkey(self):
-        """全局热键触发：切换所有启用应用静音"""
         apps = self.config.get_apps()
         enabled_apps = [name for name, info in apps.items() if info.get("enabled", False)]
-        
         if not enabled_apps:
             self.status_label.setText("没有启用的应用")
             self.status_label.setStyleSheet("color: #f59e0b; font-weight: bold;")
             return
         
-        # 获取第一个启用应用当前状态，然后统一设置
         first_state = None
         toggled_count = 0
-        
         for app_name in enabled_apps:
             if first_state is None:
-                # 查询当前状态
                 sessions = AudioController.get_audio_sessions()
                 for s in sessions:
                     if s["name"].lower() == app_name.lower():
-                        first_state = not s["mute"]  # 要切换到的目标状态
+                        first_state = not s["mute"]
                         break
-            
             target_mute = first_state if first_state is not None else True
             if AudioController.set_app_mute(app_name, target_mute):
                 toggled_count += 1
@@ -643,52 +779,67 @@ class MainWindow(QMainWindow):
         action = "静音" if (first_state is True) else "取消静音"
         self.status_label.setText(f"热键触发: {action}了 {toggled_count} 个应用")
         self.status_label.setStyleSheet("color: #059669; font-weight: bold;")
-        self.refresh_app_list()  # 刷新显示
+        self.refresh_app_list()
+    
+    def on_individual_hotkey(self, process_name: str):
+        result = AudioController.toggle_app_mute(process_name)
+        if result is not None:
+            action = "静音" if result else "取消静音"
+            self.status_label.setText(f"[{process_name}] 已{action}")
+            self.status_label.setStyleSheet("color: #059669; font-weight: bold;")
+        else:
+            self.status_label.setText(f"[{process_name}] 未运行或无法静音")
+            self.status_label.setStyleSheet("color: #dc2626; font-weight: bold;")
+        self.refresh_app_list()
     
     def on_hotkey_captured(self, hotkey_str: str):
-        """捕获到新的热键"""
         self.hotkey_display.setText(hotkey_str)
         self.config.set_hotkey(hotkey_str)
-        
-        # 重新注册热键
         if self.hotkey_thread:
-            self.hotkey_thread.update_hotkey(hotkey_str)
-        
-        self.status_label.setText(f"热键已设置为: {hotkey_str}")
+            self.hotkey_thread.refresh()
+        self.auto_save()
+        self.status_label.setText(f"全局热键已设置为: {hotkey_str}")
         self.status_label.setStyleSheet("color: #3b82f6; font-weight: bold;")
     
+    def on_individual_hotkey_captured(self, process_name: str, hotkey_str: str):
+        self.config.set_app_individual_hotkey(process_name, hotkey_str)
+        if self.hotkey_thread:
+            self.hotkey_thread.refresh()
+        self.auto_save()
+        self.status_label.setText(f"[{process_name}] 单独热键: {hotkey_str}")
+        self.status_label.setStyleSheet("color: #3b82f6; font-weight: bold;")
+        self.refresh_app_list()
+    
     def refresh_app_list(self):
-        """刷新应用列表"""
         self.table.setRowCount(0)
         sessions = AudioController.get_audio_sessions()
         config_apps = self.config.get_apps()
+        is_global = self.config.get_mode() == "global"
         
-        # 合并当前运行的应用和已配置的应用
-        all_apps: Dict[str, dict] = {}
-        
-        # 先加入运行中的应用
+        all_apps = {}
         for s in sessions:
             name = s["name"]
             all_apps[name] = {
                 "running": True,
                 "pid": s["pid"],
                 "mute": s["mute"],
-                "enabled": config_apps.get(name, {}).get("enabled", False)
+                "enabled": config_apps.get(name, {}).get("enabled", False),
+                "individual_hotkey": config_apps.get(name, {}).get("individual_hotkey")
             }
         
-        # 再加入配置中但当前未运行的应用
         for name, info in config_apps.items():
             if name not in all_apps:
                 all_apps[name] = {
                     "running": False,
                     "pid": "-",
                     "mute": False,
-                    "enabled": info.get("enabled", False)
+                    "enabled": info.get("enabled", False),
+                    "individual_hotkey": info.get("individual_hotkey")
                 }
         
-        # 填充表格
         for row, (name, data) in enumerate(sorted(all_apps.items())):
             self.table.insertRow(row)
+            self.table.setRowHeight(row, 38)
             
             # 启用复选框
             chk = QCheckBox()
@@ -711,27 +862,57 @@ class MainWindow(QMainWindow):
             # 状态
             if data["running"]:
                 status = "已静音" if data["mute"] else "正常"
-                status_color = "#dc2626" if data["mute"] else "#059669"
             else:
                 status = "未运行"
-                status_color = "#9ca3af"
             status_item = QTableWidgetItem(status)
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            status_item.setForeground(Qt.GlobalColor.gray if not data["running"] else (Qt.GlobalColor.red if data["mute"] else Qt.GlobalColor.darkGreen))
+            if not data["running"]:
+                status_item.setForeground(Qt.GlobalColor.gray)
+            elif data["mute"]:
+                status_item.setForeground(Qt.GlobalColor.red)
+            else:
+                status_item.setForeground(Qt.GlobalColor.darkGreen)
             self.table.setItem(row, 2, status_item)
             
             # PID
             pid_item = QTableWidgetItem(str(data["pid"]))
             pid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, 3, pid_item)
+            
+            # 单独热键
+            hotkey_btn = HotkeyCaptureButton()
+            hotkey_btn.set_hotkey_text(data.get("individual_hotkey") or "")
+            if is_global:
+                hotkey_btn.setEnabled(False)
+                hotkey_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #e5e7eb;
+                        color: #9ca3af;
+                        border: 1px solid #d1d5db;
+                        border-radius: 4px;
+                        padding: 2px 6px;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                """)
+            else:
+                hotkey_btn.captured.connect(lambda hk, n=name: self.on_individual_hotkey_captured(n, hk))
+            
+            hotkey_widget = QWidget()
+            hotkey_layout = QHBoxLayout(hotkey_widget)
+            hotkey_layout.addWidget(hotkey_btn)
+            hotkey_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hotkey_layout.setContentsMargins(4, 2, 4, 2)
+            self.table.setCellWidget(row, 4, hotkey_widget)
     
     def on_app_check_changed(self, process_name: str, state: int):
-        """应用勾选状态变化"""
         enabled = (state == Qt.CheckState.Checked.value)
         self.config.set_app_enabled(process_name, enabled)
+        if self.hotkey_thread:
+            self.hotkey_thread.refresh()
+        self.auto_save()
     
     def mute_all_enabled(self):
-        """静音所有启用的应用"""
         apps = self.config.get_apps()
         count = 0
         for name, info in apps.items():
@@ -741,9 +922,9 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"已静音 {count} 个应用")
         self.status_label.setStyleSheet("color: #dc2626; font-weight: bold;")
         self.refresh_app_list()
+        self.auto_save()
     
     def unmute_all_enabled(self):
-        """取消静音所有启用的应用"""
         apps = self.config.get_apps()
         count = 0
         for name, info in apps.items():
@@ -753,9 +934,15 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"已取消静音 {count} 个应用")
         self.status_label.setStyleSheet("color: #059669; font-weight: bold;")
         self.refresh_app_list()
+        self.auto_save()
+    
+    def auto_save(self):
+        """在关键节点自动保存配置"""
+        if self.config.save():
+            self.status_label.setText("✓ 配置已自动保存")
+            self.status_label.setStyleSheet("color: #6366f1; font-size: 12px;")
     
     def save_config(self):
-        """保存配置到 JSON"""
         if self.config.save():
             self.status_label.setText(f"配置已保存到 {CONFIG_FILE}")
             self.status_label.setStyleSheet("color: #6366f1; font-weight: bold;")
@@ -764,7 +951,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "保存失败", "无法写入配置文件")
     
     def closeEvent(self, event):
-        """关闭时清理"""
+        self.config.save()
         if self.hotkey_thread:
             self.hotkey_thread.stop()
         event.accept()
@@ -772,11 +959,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    
-    # 设置中文字体
     font = QFont("Microsoft YaHei", 9)
     app.setFont(font)
-    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
