@@ -6,3 +6,7 @@ config.json
 build/
 dist/
 *.spec
+
+# 日志
+*.log
+logs/

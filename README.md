@@ -30,6 +30,11 @@
 ./scripts/run
 ```
 
+## 开发模式
+```bash
+./scripts/dev
+```
+
 ## 打包
 
 ```bash
