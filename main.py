@@ -12,6 +12,7 @@ import sys
 import json
 import os
 import logging
+import time
 from typing import Dict, List, Optional
 
 from PyQt6.QtWidgets import (
@@ -1018,10 +1019,15 @@ def configure_logging(level: int = logging.INFO, log_file: str | None = None):
         log_file: 日志文件路径，None 则只输出到控制台
     """
     handlers = [logging.StreamHandler(sys.stdout)]
+
+    if log_file is None and level == logging.INFO:
+        cur_time = time.strftime("%Y_%m_%d_%H-%M-%S", time.localtime())
+        log_file = os.path.join("logs", f"{cur_time}.log")
     
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
+
     
     logging.basicConfig(
         level=level,
