@@ -52,7 +52,7 @@ except ImportError:
 
 
 CONFIG_FILE = "config.json"
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 class ConfigManager:
     """管理 config.json 的读写"""
@@ -83,7 +83,7 @@ class ConfigManager:
                                 app_data["individual_hotkey"] = None
                     return merged
             except Exception as e:
-                logger.warning(f"加载配置失败: {e}")
+                LOGGER.warning(f"加载配置失败: {e}")
         return self.DEFAULT_CONFIG.copy()
 
     def save(self) -> bool:
@@ -92,7 +92,7 @@ class ConfigManager:
                 json.dump(self.config, f, ensure_ascii=False, indent=4)
             return True
         except Exception as e:
-            logger.warning(f"保存配置失败: {e}")
+            LOGGER.warning(f"保存配置失败: {e}")
             return False
 
     def get_mode(self) -> str:
@@ -159,7 +159,7 @@ class AudioController:
                     }
                 )
         except Exception as e:
-            logger.warning(f"获取音频会话失败: {e}")
+            LOGGER.warning(f"获取音频会话失败: {e}")
         return sessions
 
     @staticmethod
@@ -174,7 +174,7 @@ class AudioController:
                     volume.SetMute(mute, None)
                     return True
         except Exception as e:
-            logger.warning(f"设置静音失败 [{process_name}]: {e}")
+            LOGGER.warning(f"设置静音失败 [{process_name}]: {e}")
         return False
 
     @staticmethod
@@ -191,7 +191,7 @@ class AudioController:
                     volume.SetMute(not current, None)
                     return not current
         except Exception as e:
-            logger.warning(f"切换静音失败 [{process_name}]: {e}")
+            LOGGER.warning(f"切换静音失败 [{process_name}]: {e}")
         return None
 
 
@@ -237,7 +237,7 @@ class HotkeyListenerThread(QThread):
                     )
                     self._handlers.append(h)
                 except Exception as e:
-                    logger.warning(f"注册全局热键失败: {e}")
+                    LOGGER.warning(f"注册全局热键失败: {e}")
         else:
             # 单独模式：为每个启用的应用注册热键
             for name, info in self.config.get_apps().items():
@@ -250,7 +250,7 @@ class HotkeyListenerThread(QThread):
                         )
                         self._handlers.append(h)
                     except Exception as e:
-                        logger.warning(f"注册单独热键失败 [{name}]: {e}")
+                        LOGGER.warning(f"注册单独热键失败 [{name}]: {e}")
 
     def stop(self):
         self._running = False
