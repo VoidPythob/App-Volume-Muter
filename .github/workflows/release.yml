@@ -1,0 +1,78 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0). Leave empty to build only.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.8'
+
+      - name: Run install script
+        shell: pwsh
+        run: .\scripts\install.ps1
+
+      - name: Run package script
+        shell: pwsh
+        run: .\scripts\package.ps1
+
+      - name: Resolve tag
+        id: resolve_tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get tag message
+        if: steps.resolve_tag.outputs.tag != ''
+        id: tag_message
+        shell: bash
+        run: |
+          TAG="${{ steps.resolve_tag.outputs.tag }}"
+          MESSAGE=$(git for-each-ref --format='%(contents)' "refs/tags/$TAG" 2>/dev/null || true)
+          
+          # 加一行 debug，确认实际拿到的是什么
+          echo "=== Tag message ==="
+          echo "$MESSAGE"
+          echo "==================="
+          
+          echo "msg<<EOF" >> $GITHUB_OUTPUT
+          echo "$MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        if: steps.resolve_tag.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
+          name: ${{ steps.resolve_tag.outputs.tag }}
+          body: ${{ steps.tag_message.outputs.msg }}
+          files: dist/App_Volume_Muter.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
