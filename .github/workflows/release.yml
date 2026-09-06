@@ -1,0 +1,51 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.8'
+
+      - name: Run install script
+        shell: pwsh
+        run: .\scripts\install.ps1
+
+      - name: Run package script
+        shell: pwsh
+        run: .\scripts\package.ps1
+
+      - name: Get tag message
+        id: tag_message
+        shell: bash
+        run: |
+          MESSAGE=$(git tag -l --format='%(contents)' ${{ github.ref_name }})
+          echo "msg<<EOF" >> $GITHUB_OUTPUT
+          echo "$MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: ${{ steps.tag_message.outputs.msg }}
+          files: dist/App_Volume_Muter.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
